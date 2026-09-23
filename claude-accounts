@@ -1,0 +1,431 @@
+#!/bin/bash
+# claude-accounts: run several Claude Code accounts side by side, with one
+# shared conversation history so any thread can be resumed from any account.
+#
+# One script, many names. Every launcher in this directory is a symlink to
+# this file, and the name it is invoked as decides what happens:
+#
+#   claude            stock profile   (~/.claude + ~/.claude.json)
+#   claude-<name>     isolated profile (~/.claude-<name>)
+#   claudech          interactive account picker
+#   claude-accounts   management: list, doctor, add, repair
+#
+# Claude Code stores each login in the macOS Keychain under a service name
+# derived from the exact CLAUDE_CONFIG_DIR string: "Claude Code-credentials"
+# when it is unset, otherwise "Claude Code-credentials-" plus the first 8 hex
+# digits of sha256(path). Never add a trailing slash to, or resolve symlinks
+# in, a profile path: a different string is a different, empty login.
+
+set -euo pipefail
+
+ROOT="${CLAUDE_ACCOUNTS_HOME:-$HOME/.claude-wrappers}"
+BIN_DIR="$ROOT/bin"
+PROFILES_FILE="$ROOT/profiles.conf"
+SHARED="${CLAUDE_SHARED_HISTORY:-$HOME/.claude-shared-history}"
+SELF="$BIN_DIR/claude-accounts"
+
+# Everything --resume, rewind and prompt history need, shared by all profiles.
+SHARED_ITEMS="projects file-history tasks session-env shell-snapshots paste-cache plans history.jsonl"
+
+die() {
+  printf 'claude-accounts: %s\n' "$*" >&2
+  exit 1
+}
+
+# --- profiles ----------------------------------------------------------------
+
+# Launcher commands in profiles.conf order.
+profiles() {
+  [ -f "$PROFILES_FILE" ] || die "missing $PROFILES_FILE"
+  awk '!/^[[:space:]]*(#|$)/ { print $1 }' "$PROFILES_FILE"
+}
+
+# Extra launch flags for a profile; fails if the profile is not configured.
+profile_flags() {
+  [ -f "$PROFILES_FILE" ] || die "missing $PROFILES_FILE"
+  awk -v cmd="$1" '
+    $1 == cmd { found = 1; $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }
+    END { exit !found }
+  ' "$PROFILES_FILE"
+}
+
+# CLAUDE_CONFIG_DIR for a profile; empty means "leave it unset" (stock).
+config_dir() {
+  case "$1" in
+    claude) printf '' ;;
+    claude-*) printf '%s/.%s' "$HOME" "$1" ;;
+    *) die "profile commands must be 'claude' or 'claude-<name>', got '$1'" ;;
+  esac
+}
+
+# Directory holding a profile's settings and history.
+profile_home() {
+  local dir
+  dir="$(config_dir "$1")"
+  printf '%s' "${dir:-$HOME/.claude}"
+}
+
+# File holding a profile's account metadata (.claude.json).
+profile_state_file() {
+  local dir
+  dir="$(config_dir "$1")"
+  printf '%s/.claude.json' "${dir:-$HOME}"
+}
+
+keychain_service() {
+  local dir
+  dir="$(config_dir "$1")"
+  if [ -z "$dir" ]; then
+    printf 'Claude Code-credentials'
+  else
+    printf 'Claude Code-credentials-%s' "$(printf '%s' "$dir" | shasum -a 256 | cut -c1-8)"
+  fi
+}
+
+account_email() {
+  local file
+  file="$(profile_state_file "$1")"
+  [ -f "$file" ] || return 0
+  grep -o '"emailAddress": *"[^"]*"' "$file" | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' || true
+}
+
+has_login() {
+  if command -v security >/dev/null 2>&1; then
+    security find-generic-password -s "$(keychain_service "$1")" >/dev/null 2>&1
+  else
+    # Linux and other platforms keep the login in a file instead.
+    [ -f "$(profile_home "$1")/.credentials.json" ]
+  fi
+}
+
+# --- locating the real Claude Code binary ------------------------------------
+
+# Follow a symlink chain to the final file.
+resolve_path() {
+  local path="$1" target
+  while [ -L "$path" ]; do
+    target="$(readlink "$path")"
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="$(dirname "$path")/$target" ;;
+    esac
+  done
+  if [ -e "$path" ]; then
+    path="$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")"
+  fi
+  printf '%s' "$path"
+}
+
+is_real_claude() {
+  local path
+  path="$(resolve_path "$1")"
+  [ -f "$path" ] && [ -x "$path" ] && [ "$path" != "$SELF" ]
+}
+
+# The native installer's updater keeps ~/.local/bin/claude pointed at the
+# newest build, so these launchers never need touching after an update.
+real_claude() {
+  local candidate versions dir
+  if [ -n "${CLAUDE_ACCOUNTS_REAL_BIN:-}" ]; then
+    printf '%s' "$CLAUDE_ACCOUNTS_REAL_BIN"
+    return
+  fi
+
+  candidate="$HOME/.local/bin/claude"
+  if is_real_claude "$candidate"; then
+    resolve_path "$candidate"
+    return
+  fi
+
+  versions="$HOME/.local/share/claude/versions"
+  if [ -d "$versions" ]; then
+    # Entries are plain version numbers such as 2.1.280.
+    # shellcheck disable=SC2012
+    for candidate in $(ls "$versions" | sort -r -V); do
+      if is_real_claude "$versions/$candidate"; then
+        printf '%s' "$versions/$candidate"
+        return
+      fi
+    done
+  fi
+
+  # npm or Homebrew installs: any other claude on PATH.
+  local IFS=:
+  for dir in $PATH; do
+    [ "$dir" = "$BIN_DIR" ] && continue
+    if is_real_claude "$dir/claude"; then
+      resolve_path "$dir/claude"
+      return
+    fi
+  done
+  return 1
+}
+
+# --- launching ---------------------------------------------------------------
+
+launch() {
+  local cmd="$1" flags dir real
+  shift
+  flags="$(profile_flags "$cmd")" || die "no profile '$cmd' in $PROFILES_FILE"
+  dir="$(config_dir "$cmd")"
+  real="$(real_claude)" || die "cannot find the Claude Code binary; install it or set CLAUDE_ACCOUNTS_REAL_BIN"
+
+  # A subscription login must not be overridden by API credentials that
+  # happen to be in the environment.
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+  if [ -z "$dir" ]; then
+    unset CLAUDE_CONFIG_DIR
+  else
+    export CLAUDE_CONFIG_DIR="$dir"
+  fi
+
+  set -f # flags are split on whitespace but never globbed
+  # shellcheck disable=SC2086
+  exec "$real" $flags "$@"
+}
+
+pick() {
+  local cmds cmd i=0 choice email
+  cmds="$(profiles)"
+  [ -n "$cmds" ] || die "no profiles in $PROFILES_FILE"
+
+  printf '\nWhich Claude account?\n'
+  for cmd in $cmds; do
+    i=$((i + 1))
+    email="$(account_email "$cmd")"
+    printf '  %d) %-18s %s\n' "$i" "$cmd" "${email:-(not logged in)}"
+  done
+  printf '\nSelect [1-%d, Enter = 1]: ' "$i"
+  { read -r choice </dev/tty; } 2>/dev/null || choice=1
+  choice="${choice:-1}"
+  case "$choice" in
+    '' | *[!0-9]*) die "not a number: $choice" ;;
+  esac
+  [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] || die "no option $choice"
+
+  cmd="$(printf '%s\n' "$cmds" | sed -n "${choice}p")"
+  printf 'Launching %s...\n\n' "$cmd"
+  launch "$cmd" "$@"
+}
+
+# --- shared history ----------------------------------------------------------
+
+# Move everything from $1 into $2 that $2 does not already have, dropping
+# exact duplicates. Whatever is left in $1 afterwards is a genuine conflict
+# and is kept for inspection.
+merge_tree() {
+  local src="$1" dst="$2" entry name
+  for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name="$(basename "$entry")"
+    if [ ! -e "$dst/$name" ] && [ ! -L "$dst/$name" ]; then
+      mv "$entry" "$dst/$name"
+    elif [ -L "$dst/$name" ] && [ ! -e "$dst/$name" ]; then
+      # A dangling link (typically one that pointed back into the profile
+      # being merged) is replaced by the real file.
+      rm "$dst/$name"
+      mv "$entry" "$dst/$name"
+    elif [ -d "$entry" ] && [ ! -L "$entry" ] && [ -d "$dst/$name" ]; then
+      merge_tree "$entry" "$dst/$name"
+    elif [ -f "$entry" ] && cmp -s "$entry" "$dst/$name"; then
+      rm "$entry"
+    fi
+  done
+}
+
+# Fold prompt-history lines from $1 into the shared history, oldest first.
+merge_history() {
+  local old="$1" index="$SHARED/history.jsonl" tmp
+  if [ ! -s "$index" ]; then
+    mv "$old" "$index"
+    return
+  fi
+  if ! awk 'NR == FNR { seen[$0] = 1; next } !($0 in seen) { exit 1 }' "$index" "$old"; then
+    tmp="$index.merge.$$"
+    cat "$index" "$old" |
+      awk '!seen[$0]++' |
+      awk '{ ts = 0; if (match($0, /"timestamp":[0-9]+/)) ts = substr($0, RSTART + 12, RLENGTH - 12); print ts "\t" $0 }' |
+      sort -s -n -k1,1 | cut -f2- >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$index"
+  fi
+  rm "$old"
+}
+
+mkdir_private() {
+  [ -d "$1" ] || mkdir -m 700 "$1"
+}
+
+ensure_shared() {
+  local item
+  mkdir_private "$SHARED"
+  for item in $SHARED_ITEMS; do
+    case "$item" in
+      *.jsonl) [ -e "$SHARED/$item" ] || install -m 600 /dev/null "$SHARED/$item" ;;
+      *) mkdir_private "$SHARED/$item" ;;
+    esac
+  done
+}
+
+# Point a profile's history at the shared store. Existing local history is
+# merged in first, so nothing is lost; conflicts stay in a dated backup.
+link_profile() {
+  local cmd="$1" home item path target backup=""
+  home="$(profile_home "$cmd")"
+  mkdir_private "$home"
+  ensure_shared
+
+  for item in $SHARED_ITEMS; do
+    path="$home/$item"
+    target="$SHARED/$item"
+    if [ -L "$path" ]; then
+      [ "$(readlink "$path")" = "$target" ] ||
+        printf 'WARN %s: %s points to %s, leaving it alone\n' "$cmd" "$path" "$(readlink "$path")" >&2
+      continue
+    fi
+    if [ -e "$path" ]; then
+      if [ -z "$backup" ]; then
+        backup="$home/local-history-before-shared-$(date +%Y%m%d-%H%M%S)"
+        mkdir -m 700 "$backup"
+      fi
+      mv "$path" "$backup/$item"
+      if [ -d "$backup/$item" ]; then
+        merge_tree "$backup/$item" "$target"
+      else
+        merge_history "$backup/$item"
+      fi
+      printf 'Merged %s %s into %s\n' "$cmd" "$item" "$target"
+    fi
+    ln -s "$target" "$path"
+  done
+
+  if [ -n "$backup" ]; then
+    find "$backup" -depth -type d -empty -delete
+    if [ -d "$backup" ]; then
+      printf 'Kept conflicting files from %s in %s\n' "$cmd" "$backup"
+    fi
+  fi
+}
+
+# --- management commands -----------------------------------------------------
+
+cmd_list() {
+  local cmd email
+  printf '%-18s %-34s %-24s %s\n' PROFILE ACCOUNT CONFIG FLAGS
+  for cmd in $(profiles); do
+    email="$(account_email "$cmd")"
+    has_login "$cmd" || email="(not logged in)"
+    printf '%-18s %-34s %-24s %s\n' "$cmd" "${email:-?}" \
+      "$(profile_home "$cmd" | sed "s|^$HOME|~|")" "$(profile_flags "$cmd")"
+  done
+}
+
+cmd_doctor() {
+  local failures=0 cmd real item path
+  ok() { printf 'ok    %s\n' "$*"; }
+  bad() {
+    printf 'FAIL  %s\n' "$*"
+    failures=$((failures + 1))
+  }
+
+  if real="$(real_claude)"; then
+    ok "Claude Code binary: $real ($("$real" --version 2>/dev/null || echo 'version unknown'))"
+  else
+    bad "Claude Code binary not found"
+  fi
+
+  path="$(command -v claude || true)"
+  if [ "$path" = "$BIN_DIR/claude" ]; then
+    ok "'claude' on PATH resolves to the launcher"
+  else
+    bad "'claude' on PATH is ${path:-missing}; put $BIN_DIR first in PATH (last lines of ~/.zshrc)"
+  fi
+
+  for cmd in $(profiles) claudech; do
+    if [ "$(readlink "$BIN_DIR/$cmd" 2>/dev/null)" = claude-accounts ]; then
+      ok "launcher $cmd"
+    else
+      bad "launcher $cmd missing; run: claude-accounts repair"
+    fi
+  done
+
+  for cmd in $(profiles); do
+    if has_login "$cmd"; then
+      ok "$cmd logged in as $(account_email "$cmd") [$(keychain_service "$cmd")]"
+    else
+      bad "$cmd not logged in; run: $cmd auth login"
+    fi
+    for item in $SHARED_ITEMS; do
+      path="$(profile_home "$cmd")/$item"
+      if [ "$(readlink "$path" 2>/dev/null)" != "$SHARED/$item" ]; then
+        bad "$cmd: $path is not linked to shared history; run: claude-accounts repair"
+      fi
+    done
+  done
+
+  if [ "$failures" -eq 0 ]; then
+    printf '\nAll good.\n'
+  else
+    printf '\n%d problem(s) found.\n' "$failures"
+    return 1
+  fi
+}
+
+cmd_add() {
+  local name="${1:-}" cmd
+  [ -n "$name" ] || die "usage: claude-accounts add <name> [launch flags...]"
+  shift
+  case "$name" in
+    *[![:lower:][:digit:]-]* | -* | '') die "profile names use only a-z, 0-9 and '-'" ;;
+  esac
+  cmd="claude-$name"
+  if profile_flags "$cmd" >/dev/null 2>&1; then
+    die "$cmd already exists"
+  fi
+  printf '%-18s %s\n' "$cmd" "$*" >>"$PROFILES_FILE"
+  cmd_repair
+  printf '\nNext: %s auth login\n' "$cmd"
+}
+
+cmd_repair() {
+  local cmd
+  mkdir -p "$BIN_DIR"
+  for cmd in $(profiles) claudech; do
+    ln -sfn claude-accounts "$BIN_DIR/$cmd"
+  done
+  for cmd in $(profiles); do
+    link_profile "$cmd"
+  done
+  printf 'Launchers and shared history are in place.\n'
+}
+
+usage() {
+  cat <<EOF
+Usage: claude-accounts <command>
+
+  list                    show profiles and the account each is logged into
+  doctor                  check PATH, launchers, logins and history links
+  add <name> [flags...]   create profile claude-<name> (then log it in)
+  repair                  recreate launchers and relink shared history
+
+Profiles live in $PROFILES_FILE.
+Log a profile in or out with: <profile> auth login | <profile> auth logout
+EOF
+}
+
+manage() {
+  case "${1:-help}" in
+    list | ls) cmd_list ;;
+    doctor) cmd_doctor ;;
+    add) shift && cmd_add "$@" ;;
+    repair) cmd_repair ;;
+    help | -h | --help) usage ;;
+    *) usage >&2 && exit 1 ;;
+  esac
+}
+
+case "$(basename "$0")" in
+  claude-accounts) manage "$@" ;;
+  claudech) pick "$@" ;;
+  *) launch "$(basename "$0")" "$@" ;;
+esac
