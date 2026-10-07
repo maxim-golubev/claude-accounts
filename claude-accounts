@@ -90,12 +90,13 @@ account_email() {
 }
 
 has_login() {
-  if command -v security >/dev/null 2>&1; then
-    security find-generic-password -s "$(keychain_service "$1")" >/dev/null 2>&1
-  else
-    # Linux and other platforms keep the login in a file instead.
-    [ -f "$(profile_home "$1")/.credentials.json" ]
+  if command -v security >/dev/null 2>&1 &&
+    security find-generic-password -s "$(keychain_service "$1")" >/dev/null 2>&1; then
+    return 0
   fi
+  # Linux and other platforms keep the login in a file instead, and so does
+  # macOS when the Keychain is locked (a login made over SSH, for example).
+  [ -f "$(profile_home "$1")/.credentials.json" ]
 }
 
 # --- locating the real Claude Code binary ------------------------------------
